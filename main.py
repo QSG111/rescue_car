@@ -6,133 +6,15 @@ from camera import CameraReader
 from decision import DecisionMaker
 from detect import Detector
 from escape import EscapeController
+from executor import ActionExecutor
 from path import PathAnalyzer
 from quality import QualityJudge
 from serial import SerialController
 
-
-class RescueExecutor:
-    """Execute timed grab and release sequences."""
-
-    def __init__(self, serial_controller):
-        self.serial_controller = serial_controller
-        self.sequence = []
-        self.current_index = 0
-        self.step_start_time = 0.0
-        self.active = False
-        self.last_trigger_time = 0.0
-        self.cooldown = 2.0
-        self.last_sequence_name = None
-        self.just_finished = None
-
-    def trigger_grab(self, side, target_type):
-        now = time.time()
-        if self.active or side not in ("LEFT", "RIGHT"):
-            return False
-        if now - self.last_trigger_time < self.cooldown:
-            return False
-
-        gripper_channel = "left_gripper" if side == "LEFT" else "right_gripper"
-        retreat_action = "BACK_SLOW"
-        retreat_time = 0.50
-        if target_type == "danger":
-            retreat_action = "BACKWARD"
-            retreat_time = 0.35
-
-        self.sequence = [
-            ("chassis", "STOP", 0.20),
-            ("sync", "DOWN", 0.50),
-            (gripper_channel, "CLOSE", 0.50),
-            ("sync", "MID", 0.40),
-            ("chassis", retreat_action, retreat_time),
-            ("chassis", "STOP", 0.20),
-        ]
-        self._start_sequence("grab", now)
-        return True
-
-    def trigger_release(self, sides):
-        now = time.time()
-        if self.active:
-            return False
-        if now - self.last_trigger_time < 0.8:
-            return False
-
-        if isinstance(sides, str):
-            sides = [sides]
-
-        release_channels = []
-        for side in sides:
-            if side == "LEFT":
-                release_channels.append("left_gripper")
-            elif side == "RIGHT":
-                release_channels.append("right_gripper")
-
-        if not release_channels:
-            return False
-
-        self.sequence = [
-            ("chassis", "STOP", 0.20),
-            ("sync", "DOWN", 0.45),
-        ]
-        for channel in release_channels:
-            self.sequence.append((channel, "OPEN", 0.35))
-        self.sequence.extend(
-            [
-                ("sync", "MID", 0.35),
-                ("chassis", "BACK_SLOW", 0.35),
-                ("chassis", "STOP", 0.20),
-            ]
-        )
-        self._start_sequence("release", now)
-        return True
-
-    def _start_sequence(self, name, now):
-        self.current_index = 0
-        self.step_start_time = 0.0
-        self.active = True
-        self.last_trigger_time = now
-        self.last_sequence_name = name
-        self.just_finished = None
-
-    def update(self):
-        self.just_finished = None
-        if not self.active:
-            return False
-
-        now = time.time()
-        if self.current_index >= len(self.sequence):
-            self.active = False
-            self.just_finished = self.last_sequence_name
-            return False
-
-        channel, action, duration = self.sequence[self.current_index]
-        if self.step_start_time == 0.0:
-            self._execute(channel, action)
-            self.step_start_time = now
-            return True
-
-        if now - self.step_start_time >= duration:
-            self.current_index += 1
-            self.step_start_time = 0.0
-            if self.current_index >= len(self.sequence):
-                self.active = False
-                self.just_finished = self.last_sequence_name
-                return False
-            next_channel, next_action, _ = self.sequence[self.current_index]
-            self._execute(next_channel, next_action)
-            self.step_start_time = now
-
-        return True
-
-    def _execute(self, channel, action):
-        if channel == "chassis":
-            self.serial_controller.send_chassis(action)
-        elif channel == "sync":
-            self.serial_controller.send_sync(action)
-        elif channel == "left_gripper":
-            self.serial_controller.send_left_gripper(action)
-        elif channel == "right_gripper":
-            self.serial_controller.send_right_gripper(action)
+SEARCH = "SEARCH"
+GRAB = "GRAB"
+GRAB_CONFIRM = "GRAB_CONFIRM"
+DELIVER = "DELIVER"
 
 
 class CarryManager:
@@ -197,47 +79,62 @@ def initialize_servos(serial_controller):
     serial_controller.send_right_gripper("OPEN")
 
 
-def empty_detection_result():
+def pick_grab_candidate(detection_result):
+    target = detection_result.get("color_target")
+    if target is None:
+        return None
+    if target.get("target_type") not in {"normal", "core", "danger"}:
+        return None
+    return target
+
+
+def choose_gripper_side(target, frame_width):
+    return "LEFT" if target["center_x"] < frame_width // 2 else "RIGHT"
+
+
+def is_grab_ready(target, frame_width, center_tolerance, grab_area):
+    if target is None:
+        return False
+    offset_x = abs(target["center_x"] - frame_width // 2)
+    return offset_x <= center_tolerance and target["area"] >= grab_area
+
+
+def make_action_context(target, side):
     return {
-        "color_targets": [],
-        "safe_zone": None,
-        "yolo": [],
-        "target": None,
+        "side": side,
+        "target_label": target["label"],
+        "target_type": target["target_type"],
+        "target_center_x": target["center_x"],
+        "target_area": target["area"],
     }
 
 
-def decide_delivery(safe_zone, path_result, frame_width):
-    if safe_zone is None:
-        if path_result["path_clear"]:
-            return "FORWARD", "search_safe_zone"
-        return path_result["best_direction"], "follow_path_to_zone"
+def confirm_grab_success(detection_result, action_context, frame_width):
+    frame_center_x = frame_width // 2
+    expected_side = action_context["side"]
+    expected_label = action_context["target_label"]
+    expected_type = action_context["target_type"]
+    expected_center_x = action_context["target_center_x"]
+    expected_area = action_context["target_area"]
 
-    offset_x = safe_zone["center_x"] - frame_width // 2
-    if safe_zone["area"] >= 22000:
-        return "STOP", "safe_zone_reached"
-    if offset_x < -50:
-        return "LEFT", "safe_zone_left"
-    if offset_x > 50:
-        return "RIGHT", "safe_zone_right"
-    return "FORWARD", "approach_safe_zone"
+    for target in detection_result.get("color_targets", []):
+        same_side = (
+            expected_side == "LEFT" and target["center_x"] < frame_center_x
+        ) or (
+            expected_side == "RIGHT" and target["center_x"] >= frame_center_x
+        )
+        if not same_side:
+            continue
 
+        similar_label = target["label"] == expected_label
+        similar_type = target["target_type"] == expected_type
+        near_previous_position = abs(target["center_x"] - expected_center_x) <= 140
+        still_large = target["area"] >= expected_area * 0.35
 
-def confirm_grab_success(detection_result, carrying_side):
-    target = detection_result.get("target")
-    if target is None:
-        return True
+        if (similar_label or similar_type) and (near_previous_position or still_large):
+            return False
 
-    frame_center_x = 320
-    near_center = abs(target["center_x"] - frame_center_x) < 90
-    large_target = target["area"] > 12000
-    same_side = (carrying_side == "LEFT" and target["center_x"] < frame_center_x) or (
-        carrying_side == "RIGHT" and target["center_x"] >= frame_center_x
-    )
-    return not (near_center and large_target and same_side)
-
-
-def confirm_release_success(detection_result):
-    return detection_result.get("safe_zone") is not None
+    return True
 
 
 def draw_debug(
@@ -247,11 +144,12 @@ def draw_debug(
     quality_result,
     decision_result,
     escaped,
-    rescue_active,
+    executor_active,
     team_color,
     phase,
     carrying_count,
     occupied_sides,
+    grab_confirm_count,
 ):
     h, w = frame.shape[:2]
 
@@ -302,10 +200,11 @@ def draw_debug(
         f"Team: {team_color}",
         f"Target: {decision_result['target_label']}/{decision_result['target_type']}",
         f"Grip side: {decision_result['gripper_side']}",
-        f"Need grab: {decision_result['should_grab']}",
+        f"Grab confirm: {grab_confirm_count}",
         f"Quality: {'GOOD' if quality_result['is_good'] else 'BAD'}",
+        f"YOLO: {'ON' if detection_result['yolo_enabled'] else 'OFF'}",
         f"Escape: {'ON' if escaped else 'OFF'}",
-        f"ActionSeq: {'RUN' if rescue_active else 'IDLE'}",
+        f"Executor: {'RUN' if executor_active else 'IDLE'}",
     ]
 
     y = 25
@@ -317,7 +216,10 @@ def draw_debug(
 def main():
     team_color = "red"
     max_carry_count = 2
-    confirm_frames_required = 2
+    grab_center_tolerance = 50
+    grab_area = 18000
+    confirm_frames_required = 3
+    confirm_timeout_seconds = 1.2
 
     camera = CameraReader(camera_id=0, width=640, height=480)
     detector = Detector(
@@ -327,17 +229,16 @@ def main():
     )
     path_analyzer = PathAnalyzer()
     quality_judge = QualityJudge()
-    decision_maker = DecisionMaker(center_tolerance=50, stop_area=25000, grab_area=18000)
+    decision_maker = DecisionMaker(center_tolerance=50, stop_area=25000, safe_zone_area=22000)
     escape_controller = EscapeController(stop_threshold=12)
     serial_controller = SerialController(port="COM3", baudrate=115200, enable_serial=False)
-    rescue_executor = RescueExecutor(serial_controller)
+    executor = ActionExecutor(serial_controller)
     carry_manager = CarryManager(max_carry_count=max_carry_count)
 
-    phase = "SEARCH"
-    action_side = None
-    action_target_type = None
+    phase = SEARCH
+    action_context = None
     grab_confirm_count = 0
-    release_confirm_count = 0
+    grab_confirm_start_time = 0.0
 
     if not camera.open():
         print("[Main] Failed to open camera.")
@@ -356,135 +257,140 @@ def main():
 
             quality_result = quality_judge.assess(frame)
             path_result = path_analyzer.analyze(frame)
+            detection_result = detector.detect(
+                frame,
+                team_color=team_color,
+                allow_yolo=quality_result["is_good"],
+            )
 
-            if quality_result["is_good"]:
-                detection_result = detector.detect(frame, team_color=team_color)
-            else:
-                detection_result = empty_detection_result()
+            frame_width = frame.shape[1]
+            escaped = False
+            should_release = False
+            decision_result = {
+                "command": "STOP",
+                "reason": "idle",
+                "gripper_side": action_context["side"] if action_context else None,
+                "target_type": action_context["target_type"] if action_context else None,
+                "target_label": action_context["target_label"] if action_context else None,
+            }
 
-            if phase == "SEARCH":
-                decision_result = decision_maker.decide(
-                    detection_result=detection_result,
-                    path_result=path_result,
-                    quality_result=quality_result,
-                    frame_width=frame.shape[1],
-                )
-            elif phase == "GRAB_CONFIRM":
+            if phase == SEARCH:
+                if carry_manager.total_count() > 0 and carry_manager.should_deliver_now():
+                    phase = DELIVER
+                    decision_result["reason"] = "switch_to_deliver"
+                else:
+                    target = detection_result.get("target")
+                    direction = decision_maker.decide_search(target, path_result, frame_width)
+                    decision_result.update(direction)
+                    if target is not None:
+                        decision_result["target_type"] = target.get("target_type")
+                        decision_result["target_label"] = target.get("label")
+                        decision_result["gripper_side"] = choose_gripper_side(target, frame_width)
+
+                    grab_target = pick_grab_candidate(detection_result)
+                    if grab_target is not None:
+                        preferred_side = choose_gripper_side(grab_target, frame_width)
+                        actual_side = carry_manager.choose_side(preferred_side)
+                        if (
+                            actual_side is not None
+                            and carry_manager.can_accept(grab_target["target_type"])
+                            and is_grab_ready(
+                                grab_target,
+                                frame_width,
+                                center_tolerance=grab_center_tolerance,
+                                grab_area=grab_area,
+                            )
+                        ):
+                            action_context = make_action_context(grab_target, actual_side)
+                            phase = GRAB
+                            decision_result["command"] = "STOP"
+                            decision_result["reason"] = "switch_to_grab"
+                            decision_result["target_type"] = grab_target["target_type"]
+                            decision_result["target_label"] = grab_target["label"]
+                            decision_result["gripper_side"] = actual_side
+
+            if phase == GRAB:
+                decision_result = {
+                    "command": "STOP",
+                    "reason": "execute_grab",
+                    "gripper_side": action_context["side"] if action_context else None,
+                    "target_type": action_context["target_type"] if action_context else None,
+                    "target_label": action_context["target_label"] if action_context else None,
+                }
+
+            if phase == GRAB_CONFIRM:
                 decision_result = {
                     "command": "STOP",
                     "reason": "confirm_grab",
-                    "gripper_side": action_side,
-                    "should_grab": False,
-                    "target_type": action_target_type,
-                    "target_label": "confirm_grab",
+                    "gripper_side": action_context["side"] if action_context else None,
+                    "target_type": action_context["target_type"] if action_context else None,
+                    "target_label": action_context["target_label"] if action_context else None,
                 }
-            elif phase == "DELIVER":
-                command, reason = decide_delivery(
-                    detection_result.get("safe_zone"),
-                    path_result,
-                    frame.shape[1],
-                )
+
+            if phase == DELIVER:
+                safe_zone = detection_result.get("safe_zone")
+                direction = decision_maker.decide_delivery(safe_zone, path_result, frame_width)
                 decision_result = {
-                    "command": command,
-                    "reason": reason,
-                    "gripper_side": action_side,
-                    "should_grab": False,
-                    "target_type": action_target_type,
+                    "command": direction["command"],
+                    "reason": direction["reason"],
+                    "gripper_side": action_context["side"] if action_context else None,
+                    "target_type": action_context["target_type"] if action_context else None,
                     "target_label": "carry_to_safe_zone",
                 }
-            else:
-                decision_result = {
-                    "command": "STOP",
-                    "reason": "confirm_release",
-                    "gripper_side": action_side,
-                    "should_grab": False,
-                    "target_type": action_target_type,
-                    "target_label": "confirm_release",
-                }
-
-            if phase == "SEARCH":
-                target_type = decision_result["target_type"]
-                preferred_side = decision_result["gripper_side"]
-                actual_side = carry_manager.choose_side(preferred_side)
-
-                if target_type is not None and not carry_manager.can_accept(target_type):
-                    decision_result["should_grab"] = False
-                    decision_result["reason"] = "carry_rule_blocked"
-
-                if decision_result["should_grab"]:
-                    decision_result["gripper_side"] = actual_side
-                    if actual_side is None:
-                        decision_result["should_grab"] = False
-                        decision_result["reason"] = "gripper_busy"
-
-                if carry_manager.total_count() > 0 and carry_manager.should_deliver_now():
+                if carry_manager.total_count() == 0:
+                    phase = SEARCH
                     decision_result["command"] = "STOP"
-                    decision_result["reason"] = "switch_to_deliver"
-                    decision_result["should_grab"] = False
-                    phase = "DELIVER"
+                    decision_result["reason"] = "empty_delivery"
+                elif direction["reason"] == "safe_zone_reached":
+                    should_release = True
 
             command = decision_result["command"]
-            if phase == "SEARCH":
+            if phase == SEARCH:
                 command, escaped = escape_controller.check_and_override(command, path_result)
-            else:
-                escaped = False
-            decision_result["command"] = command
+                decision_result["command"] = command
 
-            if not rescue_executor.active:
+            if not executor.active:
                 serial_controller.send_chassis(command)
 
-            if (
-                phase == "SEARCH"
-                and decision_result["should_grab"]
-                and decision_result["gripper_side"] is not None
-            ):
-                if rescue_executor.trigger_grab(decision_result["gripper_side"], decision_result["target_type"]):
-                    action_side = decision_result["gripper_side"]
-                    action_target_type = decision_result["target_type"]
+            if phase == GRAB and action_context is not None and not executor.active:
+                if executor.trigger_grab(action_context["side"], action_context["target_type"]):
+                    decision_result["reason"] = "grab_started"
 
-            if phase == "DELIVER" and carry_manager.total_count() > 0:
-                if not rescue_executor.active and decision_result["reason"] == "safe_zone_reached":
-                    rescue_executor.trigger_release(carry_manager.occupied_sides())
+            if phase == DELIVER and should_release and not executor.active:
+                if executor.trigger_release(carry_manager.occupied_sides()):
+                    decision_result["reason"] = "release_started"
 
-            rescue_active = rescue_executor.update()
+            executor_active = executor.update()
 
-            if rescue_executor.just_finished == "grab":
-                phase = "GRAB_CONFIRM"
+            if executor.just_finished == "grab":
+                phase = GRAB_CONFIRM
                 grab_confirm_count = 0
-                rescue_executor.just_finished = None
-            elif rescue_executor.just_finished == "release":
-                phase = "RELEASE_CONFIRM"
-                release_confirm_count = 0
-                rescue_executor.just_finished = None
+                grab_confirm_start_time = time.time()
+                executor.just_finished = None
+            elif executor.just_finished == "release":
+                carry_manager.clear()
+                action_context = None
+                phase = SEARCH
+                grab_confirm_count = 0
+                executor.just_finished = None
 
-            if phase == "GRAB_CONFIRM" and quality_result["is_good"]:
-                if confirm_grab_success(detection_result, action_side):
+            if phase == GRAB_CONFIRM and action_context is not None:
+                if confirm_grab_success(detection_result, action_context, frame_width):
                     grab_confirm_count += 1
                 else:
                     grab_confirm_count = 0
 
                 if grab_confirm_count >= confirm_frames_required:
-                    if carry_manager.register_grab(action_side, action_target_type):
-                        if carry_manager.should_deliver_now():
-                            phase = "DELIVER"
-                        else:
-                            phase = "SEARCH"
+                    if carry_manager.register_grab(action_context["side"], action_context["target_type"]):
+                        phase = DELIVER if carry_manager.should_deliver_now() else SEARCH
                     else:
-                        phase = "SEARCH"
-                    action_side = None
-                    action_target_type = None
-
-            if phase == "RELEASE_CONFIRM" and quality_result["is_good"]:
-                if confirm_release_success(detection_result):
-                    release_confirm_count += 1
-                else:
-                    release_confirm_count = 0
-
-                if release_confirm_count >= confirm_frames_required:
-                    phase = "SEARCH"
-                    carry_manager.clear()
-                    action_side = None
-                    action_target_type = None
+                        phase = SEARCH
+                    action_context = None
+                    grab_confirm_count = 0
+                elif time.time() - grab_confirm_start_time >= confirm_timeout_seconds:
+                    phase = SEARCH
+                    action_context = None
+                    grab_confirm_count = 0
 
             draw_debug(
                 frame=frame,
@@ -493,11 +399,12 @@ def main():
                 quality_result=quality_result,
                 decision_result=decision_result,
                 escaped=escaped,
-                rescue_active=rescue_active,
+                executor_active=executor_active,
                 team_color=team_color,
                 phase=phase,
                 carrying_count=carry_manager.total_count(),
                 occupied_sides=carry_manager.occupied_sides(),
+                grab_confirm_count=grab_confirm_count,
             )
             cv2.imshow("SRP Simplified", frame)
 

@@ -6,11 +6,8 @@ import numpy as np
 
 class Detector:
     """
-    目标检测模块。
-
-    1. 颜色检测是主检测，按赛规区分红/蓝/黑/黄目标
-    2. YOLO 是辅助检测，每 5 帧运行一次
-    3. 增加本方安全区颜色检测，用于回送阶段
+    Primary color detection with low-frequency YOLO assistance.
+    Color detection is always available. YOLO can be gated by image quality.
     """
 
     def __init__(self, yolo_model_path=None, yolo_stride=5, yolo_classes=None):
@@ -24,30 +21,38 @@ class Detector:
         if not yolo_model_path:
             return None
         if not os.path.exists(yolo_model_path):
-            print(f"[Detector] YOLO 权重不存在: {yolo_model_path}")
+            print(f"[Detector] YOLO weight missing: {yolo_model_path}")
             return None
         try:
             from ultralytics import YOLO
 
-            print(f"[Detector] 加载 YOLO 权重: {yolo_model_path}")
+            print(f"[Detector] Loading YOLO weights: {yolo_model_path}")
             return YOLO(yolo_model_path)
         except Exception as exc:
-            print(f"[Detector] YOLO 初始化失败: {exc}")
+            print(f"[Detector] YOLO init failed: {exc}")
             return None
 
-    def detect(self, frame, team_color="red"):
+    def detect(self, frame, team_color="red", allow_yolo=True):
         self.frame_index += 1
 
         color_targets = self._detect_color_targets(frame, team_color)
+        color_target = self._pick_best_target(color_targets, frame.shape)
         safe_zone = self._detect_safe_zone(frame, team_color)
-        yolo_result = self._detect_yolo(frame)
-        target = self._pick_target(color_targets, yolo_result, frame.shape)
+
+        yolo_enabled = bool(allow_yolo and self.yolo_model is not None)
+        yolo_result = self._detect_yolo(frame, enabled=yolo_enabled)
+        yolo_target = self._pick_best_target(yolo_result, frame.shape)
+
+        target = color_target if color_target is not None else yolo_target
 
         return {
             "color_targets": color_targets,
             "safe_zone": safe_zone,
             "yolo": yolo_result,
             "target": target,
+            "color_target": color_target,
+            "yolo_target": yolo_target,
+            "yolo_enabled": yolo_enabled,
         }
 
     def _detect_color_targets(self, frame, team_color):
@@ -144,7 +149,7 @@ class Detector:
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         best = None
         best_score = -1e9
-        frame_h, frame_w = frame.shape[:2]
+        _, frame_w = frame.shape[:2]
         frame_center_x = frame_w / 2
 
         for contour in contours:
@@ -177,9 +182,9 @@ class Detector:
 
         return best
 
-    def _detect_yolo(self, frame):
-        if self.yolo_model is None:
-            return self.last_yolo_result
+    def _detect_yolo(self, frame, enabled):
+        if not enabled:
+            return []
         if self.frame_index % self.yolo_stride != 0:
             return self.last_yolo_result
 
@@ -214,33 +219,21 @@ class Detector:
                     )
             self.last_yolo_result = detections
         except Exception as exc:
-            print(f"[Detector] YOLO 推理失败，继续使用旧结果: {exc}")
+            print(f"[Detector] YOLO inference failed, keep previous result: {exc}")
 
         return self.last_yolo_result
 
-    def _pick_target(self, color_targets, yolo_result, frame_shape):
-        if color_targets:
-            frame_h, frame_w = frame_shape[:2]
-            center_x = frame_w / 2
-            center_y = frame_h / 2
+    def _pick_best_target(self, candidates, frame_shape):
+        if not candidates:
+            return None
 
-            def score(item):
-                dx = abs(item["center_x"] - center_x)
-                dy = abs(item["center_y"] - center_y)
-                return item["priority"] * 100000 + item["area"] - 2.0 * (dx + dy)
+        frame_h, frame_w = frame_shape[:2]
+        center_x = frame_w / 2
+        center_y = frame_h / 2
 
-            return max(color_targets, key=score)
+        def score(item):
+            dx = abs(item["center_x"] - center_x)
+            dy = abs(item["center_y"] - center_y)
+            return item["priority"] * 100000 + item["area"] - 2.0 * (dx + dy)
 
-        if yolo_result:
-            frame_h, frame_w = frame_shape[:2]
-            center_x = frame_w / 2
-            center_y = frame_h / 2
-
-            def score(item):
-                dx = abs(item["center_x"] - center_x)
-                dy = abs(item["center_y"] - center_y)
-                return item["area"] - 2.0 * (dx + dy)
-
-            return max(yolo_result, key=score)
-
-        return None
+        return max(candidates, key=score)

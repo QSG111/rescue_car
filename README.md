@@ -1,316 +1,97 @@
-# 智能救援小车系统（SRP简化版）
+# rescue_car
 
-本项目是一个面向竞赛演示和 SRP 答辩的简化版智能救援小车视觉控制系统。
+救援小车视觉控制项目，当前实现按以下原则组织：
 
-设计目标：
+- 颜色检测为主，YOLO 为辅助
+- 图像质量差时关闭 YOLO，但保留颜色检测
+- 状态机固定为 `SEARCH -> GRAB -> GRAB_CONFIRM -> DELIVER`
+- `Decision` 只负责方向控制
+- `Executor` 只负责动作执行
+- `main` 负责状态机、抓取确认和整体流程
 
-- 结构简单，便于讲解和维护
-- 功能完整，覆盖摄像头、检测、路径、决策、串口、画质、脱困
-- 实时优先，不使用复杂状态机和复杂调度
-- 兼容比赛场景中的目标抓取与安全区回送
-
-## 1. 项目结构
+## 代码结构
 
 ```text
-camera.py    摄像头读取
-detect.py    目标检测 + 安全区检测 + YOLO辅助
-path.py      可通行区域判断
-decision.py  控制决策
-escape.py    自动脱困
-quality.py   画面质量判断
-serial.py    串口通信
-main.py      主程序
-README.md    项目说明
+camera.py    相机读取
+detect.py    颜色主检测、安全区检测、低频 YOLO 辅助检测
+decision.py  方向控制决策（SEARCH / DELIVER）
+executor.py  抓取与释放动作序列执行
+path.py      地面可通行方向分析
+quality.py   图像质量判断
+escape.py    SEARCH 阶段的简单脱困覆盖
+serial.py    串口命令映射与发送
+main.py      状态机、抓取确认、运载流程、模块调度
 ```
 
-## 2. 主流程
+## 当前流程
 
-`main.py` 中循环执行：
+### 1. SEARCH
 
-1. 获取图像
-2. 检测目标
-3. 判断路径
-4. 判断画面质量
-5. 做控制决策
-6. 检查自动脱困
-7. 发送底盘控制指令
-8. 接近目标后执行抓取动作
-9. 抓到目标后寻找本方安全区
-10. 到达安全区后释放目标
+- 始终运行颜色检测
+- 仅在画质良好时低频运行 YOLO
+- `DecisionMaker.decide_search()` 只输出底盘方向
+- `main.py` 根据颜色目标是否居中、是否接近、夹爪是否空闲来决定是否切到 `GRAB`
 
-系统中只保留两个简单阶段：
+### 2. GRAB
 
-- `SEARCH`：搜索并抓取目标
-- `DELIVER`：寻找安全区并回送释放
+- `main.py` 进入 `GRAB` 状态后，只触发 `ActionExecutor.trigger_grab()`
+- `executor.py` 按固定时序执行停车、下放、闭合、抬起、后退
 
-## 3. 赛规对应思路
+### 3. GRAB_CONFIRM
 
-根据你提供的赛规图片，当前代码中已经考虑以下内容：
+- 抓取动作完成后进入确认状态
+- 通过“目标是否在原侧消失”做连续多帧确认
+- 确认成功才登记夹爪占用并继续任务
+- 超时未确认则回到 `SEARCH`
 
-- 普通目标：红色 / 蓝色
-- 核心目标：黑色
-- 危险目标：黄色
-- 本方安全区：按本队颜色识别
-- 左右夹爪独立控制
-- 抓取后回送到本方安全区
+### 4. DELIVER
 
-当前优先级大致为：
+- `DecisionMaker.decide_delivery()` 只负责朝安全区行驶
+- 到达安全区后，`main.py` 触发 `ActionExecutor.trigger_release()`
+- 释放完成后清空载物状态并回到 `SEARCH`
 
-1. 黑色核心目标
-2. 本队颜色普通目标
-3. 黄色危险目标
-4. 对方颜色普通目标
+## 设计约束对应
 
-说明：
+### 识别策略
 
-- 这个优先级是为了让系统更符合比赛任务逻辑。
-- 如果你们现场策略不同，可以在 `detect.py` 里调整 `priority`。
+- `detect.py` 中 `color_target` 永远优先于 `yolo_target`
+- 抓取候选只从颜色目标里选，不依赖 YOLO 直接触发抓取
 
-## 4. 检测模块说明
+### 图像质量策略
 
-### 4.1 颜色检测
+- `main.py` 中调用 `detector.detect(..., allow_yolo=quality_result["is_good"])`
+- 画质差时仅禁用 YOLO，颜色目标和安全区检测继续运行
 
-颜色检测是主检测，使用 HSV 阈值实现：
+### 职责边界
 
-- 红色目标
-- 蓝色目标
-- 黑色目标
-- 黄色目标
-- 红/蓝安全区
+- `decision.py` 不再返回 `should_grab`、`gripper_side` 等流程字段
+- `executor.py` 不参与状态切换，只执行动作序列
+- `main.py` 统一负责状态迁移、抓取确认、运载切换
 
-优点：
+## 运行
 
-- 实时性高
-- 代码简单
-- 适合答辩说明
+安装基础依赖：
 
-### 4.2 YOLO 辅助检测
-
-YOLO 只作为辅助检测，满足你的要求：
-
-- 每 5 帧运行一次
-- 非 YOLO 帧复用上次结果
-- 当颜色检测失败时，可用 YOLO 结果兜底
-
-如果要启用 YOLO，请在 `main.py` 中设置本地权重路径：
-
-```python
-detector = Detector(
-    yolo_model_path=r"./best.pt",
-    yolo_stride=5,
-    yolo_classes=["person", "sports ball", "bottle"],
-)
+```powershell
+pip install opencv-python numpy
 ```
 
-## 5. 路径判断说明
+如需 YOLO：
 
-`path.py` 中采用最简策略：
-
-- 只看画面下半部分
-- 通过灰度阈值提取亮区域
-- 将区域分成左、中、右三部分
-- 选择更通畅的方向
-
-输出固定为：
-
-- `LEFT`
-- `RIGHT`
-- `FORWARD`
-- `STOP`
-
-## 6. 决策说明
-
-`decision.py` 负责生成控制建议：
-
-- 画面质量差时停车
-- 有目标时优先跟踪目标
-- 无目标时按通路走
-- 目标足够接近时进入抓取流程
-
-返回内容包括：
-
-- `command`
-- `reason`
-- `gripper_side`
-- `should_grab`
-- `target_type`
-- `target_label`
-
-## 7. 自动脱困说明
-
-`escape.py` 中采用简化版脱困策略：
-
-- 连续多帧停住，视为可能卡住
-- 按顺序尝试：
-  - `LEFT`
-  - `RIGHT`
-  - `BACK_SLOW`
-  - `FORWARD`
-
-这个策略简单但足够答辩和基础演示。
-
-## 8. 串口通信说明
-
-### 8.1 已写入的协议映射
-
-底盘：
-
-- `STOP -> 0x00`
-- `FORWARD -> 0x01`
-- `BACKWARD -> 0x85`
-- `LEFT -> 0x03`
-- `RIGHT -> 0x07`
-- `BACK_SLOW -> 0x24`
-- `SPIN_LEFT -> 0x21`
-- `FAST_FORWARD -> 0x22`
-- `FAST_BACKWARD -> 0x23`
-
-同步机构：
-
-- `UP -> 0x11`
-- `DOWN -> 0x13`
-- `MID -> 0x15`
-
-左夹爪：
-
-- `OPEN -> 0x31`
-- `CLOSE -> 0x33`
-- `MID -> 0x35`
-
-右夹爪：
-
-- `OPEN -> 0x32`
-- `CLOSE -> 0x34`
-- `MID -> 0x36`
-
-云台：
-
-- `SEARCH -> 0x09`
-- `AIM -> 0x10`
-
-握手：
-
-- `ACK0 -> 0x51`
-- `ACK1 -> 0x52`
-- `ACK2 -> 0x53`
-
-### 8.2 左右夹爪分开控制
-
-当前代码已经分成独立接口：
-
-```python
-serial_controller.send_left_gripper("OPEN")
-serial_controller.send_left_gripper("CLOSE")
-
-serial_controller.send_right_gripper("OPEN")
-serial_controller.send_right_gripper("CLOSE")
+```powershell
+pip install ultralytics
 ```
 
-这部分适合答辩时强调：
-
-- 左右夹爪不是同一个动作复用
-- 左右夹爪能根据目标所在侧独立选择
-
-## 9. 抓取与回送流程
-
-`main.py` 中通过 `RescueExecutor` 执行简单动作序列。
-
-### 9.1 抓取流程
-
-1. 停车
-2. 同步机构下降
-3. 按目标左右位置选择左夹爪或右夹爪闭合
-4. 同步机构回中位
-5. 后退
-6. 停车
-
-### 9.2 回送流程
-
-1. 进入 `DELIVER` 阶段
-2. 检测本方安全区
-3. 朝安全区移动
-4. 到达安全区后执行释放
-5. 释放完成后回到 `SEARCH`
-
-## 10. 如何运行
-
-进入项目目录后运行：
+运行：
 
 ```powershell
 python main.py
 ```
 
-按 `Q` 退出。
-
-## 11. 上车前需要改的参数
-
-### 11.1 本队颜色
-
-在 `main.py` 中修改：
+默认是串口调试模式：
 
 ```python
-team_color = "red"
+SerialController(port="COM3", baudrate=115200, enable_serial=False)
 ```
 
-如果抽到蓝队，改成：
-
-```python
-team_color = "blue"
-```
-
-### 11.2 串口开关
-
-默认是调试模式：
-
-```python
-serial_controller = SerialController(port="COM3", baudrate=115200, enable_serial=False)
-```
-
-上车时改成：
-
-```python
-serial_controller = SerialController(port="COM3", baudrate=115200, enable_serial=True)
-```
-
-并将 `COM3` 改为实际串口号。
-
-### 11.3 YOLO 权重
-
-默认未加载权重，比赛需要时再改：
-
-```python
-yolo_model_path=r"./best.pt"
-```
-
-### 11.4 HSV 阈值
-
-需要根据你们现场灯光微调，位置在：
-
-- `detect.py`：目标颜色阈值
-- `detect.py`：安全区颜色阈值
-
-## 12. 建议的现场调试顺序
-
-1. 先关闭串口，只看画面显示和识别框是否稳定
-2. 调颜色阈值，确认红蓝黑黄都能分出来
-3. 调安全区阈值，确认本方安全区能被识别
-4. 再打开串口，检查底盘指令是否正确
-5. 最后调夹爪动作时序
-
-## 13. 当前版本的特点
-
-优点：
-
-- 结构清晰
-- 模块齐全
-- 便于答辩
-- 适合继续加功能
-
-限制：
-
-- 路径规划还是最简版本
-- 安全区识别依赖颜色和矩形外观
-- 没有做更复杂的坐标定位
-- 没有做多目标管理和精细任务调度
-
-这些限制符合“SRP 简化版”的目标。
+上车前按实际串口修改 `port`，并把 `enable_serial` 改为 `True`。
