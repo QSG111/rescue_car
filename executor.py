@@ -2,7 +2,7 @@ import time
 
 
 class ActionExecutor:
-    """Execute timed grab and release sequences only."""
+    """仅负责执行定时抓取和释放动作序列。"""
 
     def __init__(self, serial_controller):
         self.serial_controller = serial_controller

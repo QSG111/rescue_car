@@ -6,8 +6,8 @@ import numpy as np
 
 class Detector:
     """
-    Primary color detection with low-frequency YOLO assistance.
-    Color detection is always available. YOLO can be gated by image quality.
+    以颜色检测为主，辅以低频 YOLO 检测。
+    颜色检测始终可用，YOLO 是否启用由画面质量控制。
     """
 
     def __init__(self, yolo_model_path=None, yolo_stride=5, yolo_classes=None):
@@ -16,20 +16,25 @@ class Detector:
         self.yolo_classes = yolo_classes or ["person", "sports ball", "bottle"]
         self.last_yolo_result = []
         self.yolo_model = self._load_yolo_model(yolo_model_path)
+        self.start_delivered = False
+        self.yellow_picked_count = 0
+        self.normal_picked_count = 0
+        self.current_load = 0
+        self.current_has_yellow = False
 
     def _load_yolo_model(self, yolo_model_path):
         if not yolo_model_path:
             return None
         if not os.path.exists(yolo_model_path):
-            print(f"[Detector] YOLO weight missing: {yolo_model_path}")
+            print(f"[Detector] 未找到 YOLO 权重文件: {yolo_model_path}")
             return None
         try:
             from ultralytics import YOLO
 
-            print(f"[Detector] Loading YOLO weights: {yolo_model_path}")
+            print(f"[Detector] 正在加载 YOLO 权重: {yolo_model_path}")
             return YOLO(yolo_model_path)
         except Exception as exc:
-            print(f"[Detector] YOLO init failed: {exc}")
+            print(f"[Detector] YOLO 初始化失败: {exc}")
             return None
 
     def detect(self, frame, team_color="red", allow_yolo=True):
@@ -38,6 +43,8 @@ class Detector:
         color_targets = self._detect_color_targets(frame, team_color)
         color_target = self._pick_best_target(color_targets, frame.shape)
         safe_zone = self._detect_safe_zone(frame, team_color)
+        opponent_color = "blue" if team_color == "red" else "red"
+        opponent_safe_zone = self._detect_safe_zone(frame, opponent_color)
 
         yolo_enabled = bool(allow_yolo and self.yolo_model is not None)
         yolo_result = self._detect_yolo(frame, enabled=yolo_enabled)
@@ -48,6 +55,7 @@ class Detector:
         return {
             "color_targets": color_targets,
             "safe_zone": safe_zone,
+            "opponent_safe_zone": opponent_safe_zone,
             "yolo": yolo_result,
             "target": target,
             "color_target": color_target,
@@ -55,40 +63,73 @@ class Detector:
             "yolo_enabled": yolo_enabled,
         }
 
+    def can_target_label(self, label, team_color):
+        own_ball_label = f"{team_color}_ball"
+        opponent_ball_label = "blue_ball" if team_color == "red" else "red_ball"
+
+        if self.current_load >= 3:
+            return False
+        if self.current_has_yellow:
+            return False
+        if label == opponent_ball_label:
+            return False
+        if not self.start_delivered:
+            return label == own_ball_label
+        if label == "yellow_ball":
+            return self.current_load == 0 and self.yellow_picked_count < 2 and self.normal_picked_count > 0
+        return label in {own_ball_label, "black_ball"}
+
+    def should_force_deliver(self):
+        return (not self.start_delivered) or self.current_has_yellow
+
+    def register_pick_result(self, label):
+        self.current_load += 1
+        if label == "yellow_ball":
+            self.yellow_picked_count += 1
+            self.current_has_yellow = True
+            return
+        self.normal_picked_count += 1
+
+    def register_delivery_complete(self):
+        if self.current_load > 0:
+            self.start_delivered = True
+        self.current_load = 0
+        self.current_has_yellow = False
+
     def _detect_color_targets(self, frame, team_color):
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         kernel = np.ones((5, 5), np.uint8)
 
         color_specs = [
             {
-                "name": "red",
+                "name": "red_ball",
                 "type": "normal",
-                "priority": 3 if team_color == "red" else 1,
+                "priority": 100,
                 "ranges": [
                     (np.array([0, 120, 70]), np.array([10, 255, 255])),
                     (np.array([160, 120, 70]), np.array([180, 255, 255])),
                 ],
             },
             {
-                "name": "blue",
+                "name": "blue_ball",
                 "type": "normal",
-                "priority": 3 if team_color == "blue" else 1,
+                "priority": 100,
                 "ranges": [
                     (np.array([100, 100, 60]), np.array([140, 255, 255])),
                 ],
             },
             {
-                "name": "black",
+                "name": "black_ball",
                 "type": "core",
-                "priority": 4,
+                "priority": 80,
                 "ranges": [
                     (np.array([0, 0, 0]), np.array([180, 255, 55])),
                 ],
             },
             {
-                "name": "yellow",
+                "name": "yellow_ball",
                 "type": "danger",
-                "priority": 2,
+                "priority": 120,
                 "ranges": [
                     (np.array([18, 90, 90]), np.array([38, 255, 255])),
                 ],
@@ -97,6 +138,9 @@ class Detector:
 
         candidates = []
         for spec in color_specs:
+            if not self.can_target_label(spec["name"], team_color):
+                continue
+
             mask = None
             for lower, upper in spec["ranges"]:
                 current = cv2.inRange(hsv, lower, upper)
@@ -128,59 +172,93 @@ class Detector:
         return candidates
 
     def _min_area_for_target(self, color_name):
-        if color_name == "black":
+        if color_name == "black_ball":
             return 700
         return 500
 
-    def _detect_safe_zone(self, frame, team_color):
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        kernel = np.ones((7, 7), np.uint8)
-
+    def _build_team_mask(self, hsv_frame, team_color):
         if team_color == "red":
-            mask1 = cv2.inRange(hsv, np.array([0, 100, 60]), np.array([10, 255, 255]))
-            mask2 = cv2.inRange(hsv, np.array([160, 100, 60]), np.array([180, 255, 255]))
-            mask = cv2.bitwise_or(mask1, mask2)
-        else:
-            mask = cv2.inRange(hsv, np.array([100, 100, 60]), np.array([140, 255, 255]))
+            mask_low = cv2.inRange(
+                hsv_frame,
+                np.array([0, 100, 60], dtype=np.uint8),
+                np.array([10, 255, 255], dtype=np.uint8),
+            )
+            mask_high = cv2.inRange(
+                hsv_frame,
+                np.array([170, 100, 60], dtype=np.uint8),
+                np.array([180, 255, 255], dtype=np.uint8),
+            )
+            return cv2.bitwise_or(mask_low, mask_high)
 
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        return cv2.inRange(
+            hsv_frame,
+            np.array([100, 100, 60], dtype=np.uint8),
+            np.array([140, 255, 255], dtype=np.uint8),
+        )
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        best = None
-        best_score = -1e9
-        _, frame_w = frame.shape[:2]
-        frame_center_x = frame_w / 2
+    def find_safety_zone(self, frame, team_color):
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        dilate_kernel = np.ones((5, 5), np.uint8)
+        inner_kernel = np.ones((9, 9), np.uint8)
 
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area < 2500:
-                continue
-            x, y, w, h = cv2.boundingRect(contour)
-            rect_area = float(w * h)
-            if rect_area <= 0:
-                continue
+        purple_lower = np.array([120, 40, 40], dtype=np.uint8)
+        purple_upper = np.array([160, 255, 255], dtype=np.uint8)
+        purple_mask = cv2.inRange(hsv, purple_lower, purple_upper)
+        purple_mask = cv2.dilate(purple_mask, dilate_kernel, iterations=2)
 
-            fill_ratio = area / rect_area
-            aspect = w / max(h, 1)
-            if fill_ratio < 0.45:
-                continue
-            if not (1.2 <= aspect <= 4.5):
-                continue
+        contours, _ = cv2.findContours(purple_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return {"found": False}
 
-            score = area - abs((x + w / 2) - frame_center_x) * 1.5
-            if score > best_score:
-                best_score = score
-                best = {
-                    "label": f"{team_color}_safe_zone",
-                    "bbox": (int(x), int(y), int(w), int(h)),
-                    "center_x": int(x + w / 2),
-                    "center_y": int(y + h / 2),
-                    "area": float(area),
-                    "fill_ratio": float(fill_ratio),
-                }
+        largest_contour = max(contours, key=cv2.contourArea)
+        hull = cv2.convexHull(largest_contour)
+        hull_area = float(cv2.contourArea(hull))
+        if hull_area < 5000:
+            return {"found": False}
 
-        return best
+        x, y, w, h = cv2.boundingRect(hull)
+        roi_hsv = hsv[y : y + h, x : x + w]
+        if roi_hsv.size == 0:
+            return {"found": False}
+
+        hull_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        cv2.drawContours(hull_mask, [hull], -1, 255, thickness=-1)
+        inner_mask = hull_mask[y : y + h, x : x + w]
+        inner_mask = cv2.erode(inner_mask, inner_kernel, iterations=1)
+
+        inner_area = cv2.countNonZero(inner_mask)
+        if inner_area == 0:
+            return {"found": False}
+
+        team_mask = self._build_team_mask(roi_hsv, team_color)
+        team_mask = cv2.bitwise_and(team_mask, inner_mask)
+        team_area = cv2.countNonZero(team_mask)
+        if team_area <= inner_area * 0.1:
+            return {"found": False}
+
+        center_x = int(x + w / 2)
+        center_y = int(y + h / 2)
+        return {
+            "found": True,
+            "center_x": center_x,
+            "center_y": center_y,
+            "area": hull_area,
+            "bbox": (int(x), int(y), int(w), int(h)),
+        }
+
+    def _detect_safe_zone(self, frame, team_color):
+        zone = self.find_safety_zone(frame, team_color)
+        if not zone.get("found"):
+            return None
+
+        return {
+            "label": f"{team_color}_safe_zone",
+            "bbox": zone["bbox"],
+            "center_x": int(zone["center_x"]),
+            "center_y": int(zone["center_y"]),
+            "area": float(zone["area"]),
+            "fill_ratio": 1.0,
+        }
 
     def _detect_yolo(self, frame, enabled):
         if not enabled:
@@ -219,7 +297,7 @@ class Detector:
                     )
             self.last_yolo_result = detections
         except Exception as exc:
-            print(f"[Detector] YOLO inference failed, keep previous result: {exc}")
+            print(f"[Detector] YOLO 推理失败，保留上一帧结果: {exc}")
 
         return self.last_yolo_result
 
